@@ -51,7 +51,7 @@ def create_db(connection) -> bool:
         # Таблица Categories
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS Categories (
-            category_id INT PRIMARY KEY,
+            category_id INT AUTO_INCREMENT PRIMARY KEY,
             category VARCHAR(255)
         )
         """)

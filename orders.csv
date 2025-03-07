@@ -1,0 +1,2 @@
+Order ID,User ID,Order Date,Total Amount,Status,Items Details,Type of Delivery,Address Delivery,Phone,Username
+1,78459023,2025-03-07 09:19:12,333.00,pending,"[{""quantity"": 3, ""product_id"": 101}]",da,zalupa,79277133347,
