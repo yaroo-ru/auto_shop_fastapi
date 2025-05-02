@@ -1,254 +1,438 @@
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import FSInputFile
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    Message, CallbackQuery
+)
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-import mysql.connector
-import csv
+from aiogram import Router, F
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from aiogram.types import FSInputFile
+
+import logging
 import asyncio
+from functools import partial
 import os
-import json
+import requests
 
-TOKEN = "8067818247:AAEr0596gnhNPbHyKaNgnzsGTrLmR31Lw00"
-ADMIN_ID = (784590273, 5680097082, 8129598483)  # Замените на реальный Telegram ID админа
+# 👇 импорт твоих функций
+from encar_parser import parse_encar
+from tamoz_parser import fill_rastamozhka_form
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+TOKEN = "7942224733:AAEZ3egHCgFcOBWc8Oq11A--nJ8DQkt2C3M"
 
-def get_db_connection():
-    conn = mysql.connector.connect(
-        host=os.getenv("HOST_MSQL"),
-        user=os.getenv("USER_MSQL"),
-        password=os.getenv("PASSWORD_MSQL"),
-        database=os.getenv("DATABASE_MSQL")
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+
+class CalcCarState(StatesGroup):
+    waiting_for_url = State()
+    confirming_age = State()
+    calculating_final = State()
+
+
+# --- Состояния FSM --- #
+class CalcCarState(StatesGroup):
+    waiting_for_url = State()
+
+async def run_in_thread(func, *args, **kwargs):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+ 
+# --- Клавиатура главного меню --- #
+def get_main_menu():
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+        [KeyboardButton(text="Рассчитать стоимость авто")],
+        [KeyboardButton(text="Получить консультацию")],
+        [KeyboardButton(text="О компании")],
+        [KeyboardButton(text="Этапы покупки авто подробно")],  # Новая кнопка
+        [KeyboardButton(text="Telegram-канал")],
+        [KeyboardButton(text="WhatsApp")],
+        [KeyboardButton(text="YouTube видео")],
+    ])
+    return keyboard
+
+def get_usd_to_rub_rate() -> float:
+    try:
+        response = requests.get("https://www.cbr-xml-daily.ru/daily_json.js")
+        data = response.json()
+        usd = data['Valute']['USD']['Value']
+        return float(usd)
+    except Exception as e:
+        print(f"Ошибка получения курса USD: {e}")
+        return 90.0  # запасной курс
+
+# --- Получение курса KRW → RUB --- #
+def get_krw_to_rub_rate() -> float:
+    try:
+        response = requests.get("https://www.cbr-xml-daily.ru/daily_json.js")
+        data = response.json()
+        krw = data['Valute']['KRW']['Value']
+        return float(krw)
+    except Exception as e:
+        print(f"Ошибка получения курса: {e}")
+        return 0.07  # запасной курс
+
+# --- Расчёт стоимости --- #
+def calculate_final_price(
+    age: str = None,
+    engine: str = None,
+    power: int = None,
+    volume: int = None,
+    price: int = None,
+    curr: str = "KRW",
+    max_retries: int = 3
+) -> float:
+    """Расчет итоговой стоимости с учетом типа авто"""
+    krw_rate = get_krw_to_rub_rate()
+    usd_rate = get_usd_to_rub_rate()
+    price_won = price
+    broker_fee = 90_000
+    delivery_cost = 1000 * usd_rate
+
+    # Электромобиль - упрощенный расчет
+    if engine == "4":  # 4 - код электромобиля
+        base_price = price_won * (krw_rate/1000)
+        return round((base_price + delivery_cost) * 1.3 + delivery_cost + broker_fee + 200000, 2)
+
+    # Обычный авто - полный расчет
+    customs_str = fill_rastamozhka_form(
+        age=age,
+        engine=engine,
+        power=power,
+        volume=volume,
+        price=float(price_won),
+        curr=curr
     )
-    return conn
+    customs_price = float(customs_str.replace(" ", "").replace(",", "."))
 
-# Функция для получения всех заказов
-async def fetch_orders():
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM Orders")
-    orders = cursor.fetchall()
-    conn.close()
-    return orders
-
-# Функция для получения заказов по user_id
-async def fetch_orders_by_user_id(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM Orders WHERE user_id = %s", (user_id,))
-    orders = cursor.fetchall()
-    conn.close()
-    return orders
-
-# Функция для получения всех категорий
-async def fetch_categories():
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM Categories")
-    categories = cursor.fetchall()
-    conn.close()
-    return categories
-
-# Функция для добавления категории
-async def add_category(category_name):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO Categories (category) VALUES (%s)", (category_name,))
-    conn.commit()
-    category_id = cursor.lastrowid  # Получаем ID новой категории
-    conn.close()
-    return category_id
-
-async def update_order_status(order_id, status):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE Orders SET status = %s WHERE order_id = %s", (status, order_id))
-    conn.commit()
-    conn.close()
-
-async def fetch_order_by_id(order_id):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM Orders WHERE order_id = %s", (order_id,))
-    order = cursor.fetchone()
-    conn.close()
-    return order
+    return round(customs_price + delivery_cost + broker_fee + 200000, 2)
 
 
-# Функция для выгрузки заказов в CSV
-async def export_orders():
-    orders = await fetch_orders()
-    file_path = "orders.csv"
-    with open(file_path, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["Order ID", "User ID", "Order Date", "Total Amount", "Status", "Items Details", "Type of Delivery", "Address Delivery", "Phone", "Username"])
-        for order in orders:
-            writer.writerow([
-                order["order_id"],
-                order["user_id"],
-                order["order_date"],
-                order["total_amount"],
-                order["status"],
-                order["items_details"],
-                order["type_of_delivery"],
-                order["address_delivery"],
-                order["phone"],
-                order["username"]
+
+
+
+# --- Старт --- #
+@router.message(CommandStart())
+async def send_welcome(message: Message):
+    welcome_text = """
+    Приветствуем вас в YU Auto-Trade Co.Ltd!
+
+    Мы рады видеть вас в нашем телеграм-боте, который создан для того, чтобы сделать процесс покупки автомобиля из Кореи максимально простым и удобным. Здесь вы сможете:
+
+    🚗 Рассчитать стоимость автомобиля под ключ
+    💬 Получить онлайн консультацию от наших экспертов
+    📦 Узнать о всех этапах доставки и оформления
+
+    Ваш новый автомобиль уже ждет вас!
+    """
+
+    photo = FSInputFile("welcome.jpg")  # 💥 ВАЖНО: используем FSInputFile для локального файла
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Начать", callback_data="start_menu")
+
+    await message.answer_photo(photo=photo, caption=welcome_text, reply_markup=builder.as_markup())
+
+
+# --- Главное меню --- #
+@router.callback_query(F.data == "start_menu")
+async def show_main_menu(callback_query: CallbackQuery):
+    await callback_query.message.answer("Главное меню:", reply_markup=get_main_menu())
+    await callback_query.answer()
+
+
+@router.message(F.text == "Этапы покупки авто подробно")
+async def handle_steps(message: Message):
+    await message.answer("📘 Ознакомьтесь со статьёй: https://dzen.ru/a/Zt2KmIZPxyrRwym5")
+
+@router.callback_query(F.data == "calc_details")
+async def show_calculation_details(callback: CallbackQuery, state: FSMContext):
+    try:
+        # Получаем сохраненные данные
+        data = await state.get_data()
+        car_data = data.get("original_data")
+        last_price = data.get("last_price")
+
+        if not car_data or not last_price:
+            await callback.answer("❌ Данные не найдены", show_alert=True)
+            return
+
+        # Получаем курс валют (для отображения)
+        usd_rate = get_usd_to_rub_rate()
+        krw_rate = get_krw_to_rub_rate()
+        delivery_vlad = 1000 * usd_rate
+        delivery_moscow = 200000
+        broker_fee = 90000
+
+        # Рассчитываем таможенные платежи (из уже готовой цены)
+        customs_payment = last_price - delivery_vlad - delivery_moscow - broker_fee - (int(car_data['Price (₩)'])*krw_rate/1000)
+
+        await callback.message.answer(
+            f"🧮 <b>Детализация расчета:</b>\n\n"
+            f"🇰🇷 <b>Стоимость в Корее:</b> {car_data['Price (₩)']} ₩ / {str(int(car_data['Price (₩)'])*krw_rate/1000).replace(".",",")} ₽\n"
+            f"🛃 <b>Таможенные платежи:</b> {customs_payment:,.2f} ₽\n"
+            f"🚢 <b>Доставка до Владивостока:</b> 1000$ (~{delivery_vlad:,.0f} ₽)\n"
+            f"👔 <b>Услуги брокера:</b> {broker_fee:,.0f} ₽\n"
+            f"🚛 <b>Доставка до Москвы:</b> {delivery_moscow:,.0f} ₽\n\n"
+            f"💵 <b>Итого:</b> {last_price:,.2f} ₽\n\n"
+            f"ℹ️ Курс доллара: {usd_rate:.2f} ₽",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="ℹ️ Услуги брокера", callback_data="broker_details")],
+                [InlineKeyboardButton(text="💬 Консультация", url="https://t.me/AutoTradeCoLtd")],
+                [InlineKeyboardButton(text="🔄 Новый расчет", callback_data="start_menu")]
             ])
-    return file_path
+        )
+        await callback.answer()
 
-# Функция для выгрузки категорий в CSV
-async def export_categories():
-    categories = await fetch_categories()
-    file_path = "categories.csv"
-    with open(file_path, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["Category ID", "Category Name"])
-        for category in categories:
-            writer.writerow([category["category_id"], category["category"]])
-    return file_path
+    except Exception as e:
+        logging.error(f"Ошибка детализации: {str(e)}")
+        await callback.answer("❌ Ошибка при отображении данных", show_alert=True)
 
-async def add_product(name, description, price, category_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO Products (name, description, price, category_id)
-    VALUES (%s, %s, %s, %s)
-    """, (name, description, price, category_id))
-    conn.commit()
-    conn.close()
-
-async def delete_product(product_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM Products WHERE product_id = %s", (product_id,))
-    conn.commit()
-    conn.close()
-
-async def export_products():
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM Products")
-    products = cursor.fetchall()
-    conn.close()
-
-    file_path = "products.csv"
-    with open(file_path, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["Product ID", "Name", "Description", "Price", "Category ID"])
-        for product in products:
-            writer.writerow([
-                product["product_id"],
-                product["name"],
-                product["description"],
-                product["price"],
-                product["category_id"]
-            ])
-    return file_path
-
-# Команда /start
-@dp.message(Command("start"))
-async def start_handler(message: types.Message):
-    if message.from_user.id in ADMIN_ID:
-        builder = InlineKeyboardBuilder()
-        builder.button(text="Добавить продукт", callback_data="add_product")
-        builder.button(text="Удалить продукт", callback_data="delete_product")
-        builder.button(text="Выгрузить список продуктов", callback_data="export_products")
-        builder.button(text="Выгрузить список заказов", callback_data="export_orders")
-        builder.button(text="Получить заказ по ID", callback_data="get_order_by_id")
-        builder.button(text="Получить заказы по user_id", callback_data="get_orders_by_user_id")
-        builder.button(text="Изменить статус заказа", callback_data="update_order_status")
-        builder.button(text="Выгрузить список категорий", callback_data="export_categories")
-        builder.button(text="Добавить категорию", callback_data="add_category")
-        builder.adjust(1)
-        await message.answer("Админ-меню:", reply_markup=builder.as_markup())
-    else:
-        await message.answer("У вас нет доступа к этой команде.")
-
-
-# Обработка callback-запросов
-@dp.callback_query()
-async def handle_callback(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_ID:
-        await callback.answer("Нет доступа")
-        return
-    
-    if callback.data == "add_product":
-        await callback.message.answer("Отправьте данные продукта в формате: Имя, Описание, Цена, Категория ID")
-    elif callback.data == "delete_product":
-        await callback.message.answer("Отправьте ID продукта, который нужно удалить")
-    elif callback.data == "export_products":
-        file_path = await export_products()
-        file = FSInputFile(file_path)
-        await callback.message.answer_document(file)
-    elif callback.data == "export_orders":
-        file_path = await export_orders()
-        file = FSInputFile(file_path)
-        await callback.message.answer_document(file)
-    elif callback.data == "get_order_by_id":
-        await callback.message.answer("Отправьте ID заказа")
-    elif callback.data == "get_orders_by_user_id":
-        await callback.message.answer("Отправьте user_id")
-    elif callback.data == "update_order_status":
-        await callback.message.answer("Отправьте данные в формате: ID заказа, Новый статус")
-    elif callback.data == "export_categories":
-        file_path = await export_categories()
-        file = FSInputFile(file_path)
-        await callback.message.answer_document(file)
-    elif callback.data == "add_category":
-        await callback.message.answer("Отправьте имя категории")
+@router.callback_query(F.data == "broker_details")
+async def show_broker_services(callback: CallbackQuery):
+    await callback.message.answer(
+        "👔 <b>Услуги таможенного брокера (90.000₽):</b>\n\n"
+        "• СБКТС\n• ЭПТС\n• Временная регистрация\n"
+        "• СВХ\n• Выгрузка в порту\n• Лаборатория\n\n"
+        "⚠️ <i>Возможна доплата 3000-5000₽ за СВХ при просрочке оплаты пошлины</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Консультация", url="https://t.me/AutoTradeCoLtd")],
+            [InlineKeyboardButton(text="🔄 Новый расчет", callback_data="start_menu")]
+        ])
+    )
     await callback.answer()
 
 
-# Обработка сообщений
-@dp.message()
-async def process_message(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    text = message.text.split(", ")
-    if len(text) == 4:
-        # Добавление продукта
-        try:
-            name, description, price, category_id = text
-            await add_product(name, description, float(price), int(category_id))
-            await message.answer("Продукт добавлен!")
-        except ValueError:
-            await message.answer("Ошибка в формате данных.")
-    elif len(text) == 2 and text[0].isdigit():
-        # Изменение статуса заказа
-        order_id, status = text
-        await update_order_status(int(order_id), status)
-        await message.answer(f"Статус заказа {order_id} изменён на '{status}'!")
-    elif len(text) == 1:
-        if text[0].isdigit():
-            # Если отправлен один ID, это может быть order_id, user_id или product_id
-            order_id = int(text[0])
-            order = await fetch_order_by_id(order_id)
-            if order:
-                await message.answer(f"Заказ:\n{order}")
-            else:
-                user_id = order_id
-                orders = await fetch_orders_by_user_id(user_id)
-                if orders:
-                    await message.answer(f"Заказы для user_id {user_id}:\n{orders}")
-                else:
-                    product_id = order_id
-                    await delete_product(product_id)
-                    await message.answer(f"Продукт с ID {product_id} удалён!")
+# --- Обработка меню --- #
+@router.message(F.text == "Рассчитать стоимость авто")
+async def handle_calc_request(message: Message, state: FSMContext):
+    await message.answer("Введите ссылку на автомобиль с сайта www.encar.com")
+    await state.set_state(CalcCarState.waiting_for_url)
+
+@router.message(F.text == "Получить консультацию")
+async def handle_consult_request(message: Message):
+    await message.answer("Свяжитесь с нашим менеджером: @AutoTradeCoLtd")
+
+@router.message(F.text == "О компании")
+async def handle_about(message: Message):
+    await message.answer("""
+
+YU Auto-Trade Co.Ltd – ваш надежный партнер в мире автомобилей из Кореи!
+
+Мы обеспечиваем тщательный подбор авто учитывая все ваши пожелания, выбирая самые лучшие по состоянию и стоимости.
+
+Мы не берем дополнительных оплат за нашу работу, скрытых комиссий и тп, у нас вы платите только за свой автомобиль и его доставку (доп. расходы, например комплект новой резины обсуждаются отдельно).
+
+Нам доверяют клиенты из Росиии, Казахстана, ОАЭ и не только. Живые отзывы вы можете посмотреть в нашем тг-канале: https://t.me/YuAutotrade
+
+Мы предоставляем полную информацию о каждом автомобиле, включая историю, технические характеристики, подробные видео-обзоры и фотографии посл осмотров. Вы всегда будете в курсе всех деталей по выбранным авто.
+
+Мы сопровождаем вам на каждом этапе – от выбора автомобиля до его доставки.
+
+По всем вопросам обращайтесь @AutoTradeCoLtd
+
+Следите за нами в социальных сетях:
+- Запрещенная соцсеть Instagram: https://www.instagram.com/yuautotrade?igsh=bWttdnUxYmVwOWNp
+- VK: https://vk.com/yuautotrade
+- YouTube: https://youtube.com/@autotradecoltd?si=EAFdBi02XZJ7sq_A
+- Канал в Тelegram: https://t.me/YuAutotrade
+- Яндекс Дзен: https://dzen.ru/a/Zt2KmIZPxyrRwym5
+
+YU Auto-Trade Co.Ltd – ваш надежный партнёр
+""")
+
+@router.message(F.text == "Telegram-канал")
+async def handle_telegram_link(message: Message):
+    await message.answer("Подпишитесь на наш Telegram-канал: https://t.me/YuAutotrade")
+
+@router.message(F.text == "WhatsApp")
+async def handle_whatsapp(message: Message):
+    await message.answer("Напишите нам в WhatsApp: https://wa.clck.bar/821055568394?text=%D0%97%D0%B4%D1%80%D0%B0%D0%B2%D1%81%D1%82%D0%B2%D1%83%D0%B9%D1%82%D0%B5!%20%D0%9C%D0%B5%D0%BD%D1%8F%20%D0%B8%D0%BD%D1%82%D0%B5%D1%80%D0%B5%D1%81%D1%83%D0%B5%D1%82%20%D0%BF%D0%BE%D0%BA%D1%83%D0%BF%D0%BA%D0%B0%20%D0%B0%D0%B2%D1%82%D0%BE%D0%BC%D0%BE%D0%B1%D0%B8%D0%BB%D1%8F%20%D0%B8%D0%B7%20%D0%9A%D0%BE%D1%80%D0%B5%D0%B8")
+
+@router.message(F.text == "YouTube видео")
+async def handle_youtube(message: Message):
+    await message.answer("Посмотрите наше видео: https://youtube.com/examplevideo")
+
+@router.message(F.text.startswith("https://fem.encar.com/cars/"))
+async def handle_encar_link(message: Message, state: FSMContext):
+    url = message.text.strip()
+    await message.answer("🔍 Парсим информацию об автомобиле...\nЭто может занять некоторое время")
+
+    try:
+        # Выносим синхронный парсинг в отдельный поток
+        result = await run_in_thread(parse_encar, url)
+        await message.answer("Я не сломался и не завис, я считаю таможенный платеж, еще немного и вы увидите стоимость машины")
+        if not result or any(v == "Не найдено" for v in result.values()):
+            await message.answer("🚫 Не удалось получить данные по ссылке. Попробуйте другую.")
+            return
+        
+        
+        # Сохраняем оригинальные данные
+        await state.update_data(
+            original_data=result,
+            current_age=result["Age category"]
+        )
+
+        # Выносим синхронный расчет в отдельный поток
+        if result["Engine type"] == "4":
+            # Для электромобилей передаем только необходимые параметры
+            final_price = await run_in_thread(
+                calculate_final_price,
+                engine="4",  # Главный маркер электромобиля
+                price=float(result["Price (₩)"])
+            )
         else:
-            # Добавление категории
-            category_name = text[0]
-            category_id = await add_category(category_name)
-            await message.answer(f"Категория добавлена! ID: {category_id}")
-    else:
-        await message.answer("Неверный формат ввода.")
+            # Для обычных авто передаем все параметры
+            final_price = await run_in_thread(
+                calculate_final_price,
+                age=result["Age category"],
+                engine=result["Engine type"],
+                power=150,  # Можно получать из данных или оставить по умолчанию
+                volume=int(result["Engine volume"]),
+                price=float(result["Price (₩)"])
+            )
+
+        # Сохраняем последнюю цену в состоянии
+        await state.update_data(last_price=final_price)
+
+        engine = None
+
+        if result['Engine type'] == "1":
+            engine = "Бензин"
+        elif result['Engine type'] == "2":
+            engine = "Дизель"
+        elif result['Engine type'] == "3":
+            engine ="Гибрид"
+        elif result['Engine type'] == "4":
+            engine = "Электро"
+
+        # Остальной код обработки ответа остается без изменений
+        await message.answer(
+            f"<b>Стоимость автомобиля под ключ во Владивостоке: </b>\n\n"
+            f"<b>{final_price:,.2f} ₽</b>\n\n"
+            f"<b>Год и месяц выпуска: </b>{result['Manufacture date']}"
+            f"<i>(у иностранных авто указана дата первичной постановки на учет, а не вин-код/дата производства, в среднем разница составляет 3-4 месяца)</i>\n"
+            f"<b>Пробег:</b> {result['Mileage']}\n"
+            f"<b>Возраст: </b> {result['Age category']}\n"
+            f"<b>Тип двигателя:</b> {engine}\n"
+            f"<b>Объём двигателя:</b> {result['Engine volume']}\n"
+            f"ℹ️ <i>Стоимость может изменяться в зависимости от курса валют и индивидуальных параметров автомобиля. Для точного расчета напишите менеджеру</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Калькуляция стоимости авто", callback_data="calc_details")],
+                [InlineKeyboardButton(text="Изменить возраст", callback_data="change_age")],
+                [InlineKeyboardButton(text="Получить консультацию", url="https://t.me/AutoTradeCoLtd")]
+            ])
+        )
+
+    except Exception as e:
+        await message.answer(f"❌ Произошла ошибка: {str(e)}")
+        logging.error(f"Error in handle_encar_link: {str(e)}")
+
+@router.callback_query(F.data == "change_age")
+async def show_age_options(callback: CallbackQuery):
+    """Показываем кнопки выбора возрастной категории"""
+    await callback.message.edit_reply_markup(
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="До 3 лет", callback_data="age_cat_0-3")],
+            [InlineKeyboardButton(text="3–5 лет", callback_data="age_cat_3-5")],
+            [InlineKeyboardButton(text="5–7 лет", callback_data="age_cat_5-7")],
+            [InlineKeyboardButton(text="Старше 7 лет", callback_data="age_cat_7-0")],
+        ])
+    )
+    await callback.answer("Выберите возрастную категорию")
+
+@router.callback_query(F.data.startswith("age_cat_"))
+async def process_age_change(callback: CallbackQuery, state: FSMContext):
+    try:
+        # Получаем выбранную возрастную категорию
+        age_category = callback.data.split("_")[-1]  # "0-3", "3-5", "5-7", "7-0"
+
+        # Достаем сохраненные данные
+        user_data = await state.get_data()
+        car_data = user_data.get("original_data")
+        print(car_data)
+
+        if not car_data:
+            await callback.answer("❌ Данные не найдены. Начните расчет заново.", show_alert=True)
+            return
+
+        await callback.message.edit_text("🔄 Пересчитываем стоимость...")
+
+        # Расчет стоимости
+        if car_data["Engine type"] == "4":
+            final_price = calculate_final_price(
+                engine="4",
+                price=float(car_data["Price (₩)"])
+            )
+        else:
+            final_price = calculate_final_price(
+                age=age_category,
+                engine=car_data["Engine type"],
+                power=150,
+                volume=int(car_data["Engine volume"]),
+                price=float(car_data["Price (₩)"])
+            )
+
+        # Сохраняем новую цену и возраст
+        await state.update_data(
+            last_price=final_price,
+            current_age=age_category
+        )
+
+        # Форматируем вывод
+        age_display = {
+            "0-3": "до 3 лет",
+            "3-5": "от 3 до 5 лет",
+            "5-7": "от 5 до 7 лет",
+            "7-0": "старше 7 лет"
+        }.get(age_category, car_data['Age category'])
+
+        await callback.message.edit_text(
+            f"🚗 <b>Стоимость автомобиля под ключ в Москве:</b> {final_price:,.2f} ₽\n\n"
+            f"📅 <b>Год выпуска:</b> {car_data['Manufacture date']}\n"
+            f"<i>(дата первичной постановки на учет, разница с производством 3-4 месяца)</i>\n\n"
+            f"🛠 <b>Объём двигателя:</b> {car_data['Engine volume']}\n"
+            f"📊 <b>Возрастная категория:</b> {age_display}\n\n"
+            f"ℹ️ Стоимость может изменяться. Для точного расчета напишите менеджеру",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🧮 Калькуляция стоимости", callback_data="calc_details")],
+                [InlineKeyboardButton(text="💬 Консультация", url="https://t.me/AutoTradeCoLtd")],
+                [InlineKeyboardButton(text="🔄 Новый расчет", callback_data="start_menu")]
+            ])
+        )
+
+    except Exception as e:
+        logging.error(f"Ошибка в process_age_change: {str(e)}")
+        await callback.message.edit_text(
+            "❌ Ошибка при пересчете. Попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👨‍💼 Менеджер", url="https://t.me/AutoTradeCoLtd")]]
+            )
+        )
 
 
-# Запуск бота
+# --- Запуск бота --- #
 async def main():
+    dp.include_router(router)
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
